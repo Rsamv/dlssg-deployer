@@ -46,6 +46,7 @@ $script:AllProxyNames = @('version.dll') + $script:AltNames
 $script:MinDriver     = 500.0
 $script:SignerMatch   = 'DLSSG Native Project'
 $script:DownloadTimeoutSec = 120
+$script:MaxScanDepth  = 8
 
 $script:Gpu             = $null
 $script:Router          = $null
@@ -335,6 +336,12 @@ function Get-CandidateGameFolders {
     foreach ($f in (Get-GogGameFolders))  { Add-GameFolder $f (Split-Path -Leaf $f) }
 
     $commonNames = @('SteamLibrary\steamapps\common', 'Games', 'Game', 'Epic Games', 'GOG Games')
+    $skipNames   = @(
+        'windows', 'program files', 'program files (x86)', 'programdata', 'recovery',
+        'perflogs', 'msocache', 'config.msi', '$winreagent', 'users', 'documents and settings',
+        'intel', 'amd', 'nvidia', 'temp', 'tmp', 'node_modules', '.git', 'boot', 'efi',
+        'system volume information', '$recycle.bin'
+    )
     $drives = Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
               Where-Object { $_.Root -match '^[A-Za-z]:\\$' }
     foreach ($d in $drives) {
@@ -346,6 +353,12 @@ function Get-CandidateGameFolders {
                 }
             }
         }
+        # 盘符根目录下的独立游戏（免安装 / 第三方启动器）
+        Get-ChildItem -LiteralPath $d.Root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($skipNames -contains $_.Name.ToLower()) { return }
+            if ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return }
+            Add-GameFolder $_.FullName $_.Name
+        }
     }
     return $result
 }
@@ -353,23 +366,29 @@ function Get-CandidateGameFolders {
 # 在游戏目录中查找 nvngx_dlssg.dll，返回安装目标目录
 function Find-DlssgTarget([string]$folder) {
     try {
-        $dlls = Get-ChildItem -LiteralPath $folder -Recurse -Depth 5 -Filter 'nvngx_dlssg.dll' -File -ErrorAction SilentlyContinue
+        $dlls = Get-ChildItem -LiteralPath $folder -Recurse -Depth $script:MaxScanDepth -Filter 'nvngx_dlssg.dll' -File -ErrorAction SilentlyContinue
     } catch { return $null }
     if (-not $dlls) { return $null }
 
     $dirs = $dlls | ForEach-Object { $_.DirectoryName } | Select-Object -Unique |
             Sort-Object { $_.Length }
+    # 1) DLL 与 EXE 同目录（绝大多数游戏）
     foreach ($d in $dirs) {
         $exe = Get-ChildItem -LiteralPath $d -Filter '*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($exe) { return $d }
     }
+    # 2) DLL 位于子目录（如 UE 的 Streamline 插件）：取体积最大的主程序所在目录
+    $mainExe = Get-ChildItem -LiteralPath $folder -Recurse -Depth $script:MaxScanDepth -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+               Sort-Object Length -Descending | Select-Object -First 1
+    if ($mainExe) { return $mainExe.DirectoryName }
+    # 3) 兜底：返回最浅的 DLL 目录
     return ($dirs | Select-Object -First 1)
 }
 
 # 查找已安装本 Mod 的目录（以 dlssg_sm86.ini 为标志）
 function Find-InstalledTarget([string]$folder) {
     try {
-        $inis = Get-ChildItem -LiteralPath $folder -Recurse -Depth 5 -Filter 'dlssg_sm86.ini' -File -ErrorAction SilentlyContinue
+        $inis = Get-ChildItem -LiteralPath $folder -Recurse -Depth $script:MaxScanDepth -Filter 'dlssg_sm86.ini' -File -ErrorAction SilentlyContinue
     } catch { return $null }
     if (-not $inis) { return $null }
 
@@ -739,15 +758,18 @@ function Invoke-UninstallFlow {
         }
     } else {
         Invoke-ScanInstalled
-        Add-ManualGames -Installed
     }
 
-    if ($script:Games.Count -eq 0) { Write-Warn2 '没有找到可卸载的安装。'; return }
+    if ($script:Games.Count -eq 0) {
+        Write-Warn2 '没有找到可卸载的安装。'
+        Add-ManualGames -Installed
+        if ($script:Games.Count -eq 0) { return }
+    }
 
     Write-Head '选择要卸载的游戏'
     Show-GameList -Installed
     Write-Host ''
-    Write-Info '输入编号（如 1,3）、a=全部、n=手动添加、q=返回。'
+    Write-Info '输入编号（如 1,3）、a=全部、n=手动输入路径、q=返回。'
 
     while ($true) {
         $sel = Read-IndexSelection $script:Games.Count
@@ -806,15 +828,18 @@ function Invoke-SwitchPresetFlow {
         }
     } else {
         Invoke-ScanInstalled
-        Add-ManualGames -Installed
     }
 
-    if ($script:Games.Count -eq 0) { Write-Warn2 '没有找到已安装 Mod 的游戏。'; return }
+    if ($script:Games.Count -eq 0) {
+        Write-Warn2 '没有找到已安装 Mod 的游戏。'
+        Add-ManualGames -Installed
+        if ($script:Games.Count -eq 0) { return }
+    }
 
     Write-Head '选择要切换档位的游戏'
     Show-GameList -Installed
     Write-Host ''
-    Write-Info '输入编号（如 1,3）、a=全部、n=手动添加、q=返回。'
+    Write-Info '输入编号（如 1,3）、a=全部、n=手动输入路径、q=返回。'
 
     while ($true) {
         $sel = Read-IndexSelection $script:Games.Count
@@ -852,15 +877,18 @@ function Invoke-InstallFlow {
         }
     } else {
         Invoke-ScanGames
-        Add-ManualGames
     }
 
-    if ($script:Games.Count -eq 0) { Write-Warn2 '没有可安装的游戏。'; return }
+    if ($script:Games.Count -eq 0) {
+        Write-Warn2 '没有找到支持 DLSS 帧生成的游戏。'
+        Add-ManualGames
+        if ($script:Games.Count -eq 0) { return }
+    }
 
     Write-Head '选择要安装的游戏'
     Show-GameList
     Write-Host ''
-    Write-Info '输入编号（如 1,3,5）、a=全部、n=手动添加、q=返回。'
+    Write-Info '输入编号（如 1,3,5）、a=全部、n=手动输入路径、q=返回。'
 
     while ($true) {
         $sel = Read-IndexSelection $script:Games.Count
