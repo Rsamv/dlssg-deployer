@@ -1,6 +1,6 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
-    DLSSG Native 0.2.4 - 一键部署 / 管理工具
+    DLSSG for SM86 (Proxy) 0.3.5 - 一键部署 / 管理工具
     ------------------------------------------------------------
     - 检测当前 NVIDIA 显卡架构 (SM75 / SM86) 与驱动版本
     - 自动扫描 Steam / Epic / GOG / 常见目录，找出支持
@@ -8,15 +8,15 @@
     - 支持手动添加游戏目录
     - 安装 / 更新：将代理 DLL 与 dlssg_sm86.ini 安装到游戏目录
     - 卸载：仅移除本项目的代理 DLL 与 INI，可恢复备份
-    - 档位切换：精确 (HardwareBilinear=0) / 性能 (HardwareBilinear=1)
+    - 档位切换：一致性档位 [FrameGeneration] Optimized 0-3
+      0=原厂内核 / 1=逐位一致优化(默认) / 2=有损约50dB / 3=全部有损最快
     ------------------------------------------------------------
 #>
 [CmdletBinding()]
 param(
     [switch]$NoPause,
     [switch]$ListOnly,
-    [ValidateSet('Exact', 'Performance')]
-    [string]$Preset,
+    [int]$Tier = -1,
     [switch]$Uninstall,
     [switch]$SwitchPreset,
     [string]$RepoUrl,
@@ -41,18 +41,39 @@ $script:PackageRoot   = $null
 $script:ProxyDefault  = $null
 $script:IniSource     = $null
 $script:AltDir        = $null
-$script:AltNames      = @('winmm.dll', 'dinput8.dll', 'winhttp.dll', 'dxgi.dll')
+$script:AltNames      = @('winmm.dll', 'dbghelp.dll', 'dinput8.dll', 'dxgi.dll', 'd3d12.dll')
 $script:AllProxyNames = @('version.dll') + $script:AltNames
 $script:MinDriver     = 500.0
-$script:SignerMatch   = 'DLSSG Native Project'
+$script:SignerMatch   = @('DLSSG for SM86', 'DLSSG Native Project')
 $script:DownloadTimeoutSec = 120
 $script:MaxScanDepth  = 8
+
+# 出厂 INI 兜底：包内 dlssg_sm86.ini 缺失且下载失败时使用
+$script:IniFallback = @'
+[General]
+Enabled=1
+
+[FrameGeneration]
+Optimized=1
+MaxGeneratedFrames=3
+
+[Compatibility]
+Preset=Auto
+
+[Logging]
+Level=1
+Directory=dlssg_sm86\logs
+
+[Runtime]
+Mode=Bundled
+CacheDirectory=
+'@
 
 $script:Gpu             = $null
 $script:Router          = $null
 $script:GpuState        = 'Unknown'
 $script:Games           = @()
-$script:PresetMode      = if ($Preset) { $Preset } else { $null }
+$script:PresetMode      = if ($Tier -ge 0) { $Tier } else { $null }
 $script:KnownProxyHashes = @{}
 
 # ============================================================
@@ -106,19 +127,36 @@ function Get-Sha256([string]$path) {
 function Test-ProxySignature([string]$path) {
     try { $sig = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop } catch { return $false }
     if ($sig.Status -eq 'NotSigned') { return $false }
-    if ($sig.SignerCertificate -and $sig.SignerCertificate.Subject -match [regex]::Escape($script:SignerMatch)) { return $true }
+    if (-not $sig.SignerCertificate) { return $false }
+    foreach ($cn in $script:SignerMatch) {
+        if ($sig.SignerCertificate.Subject -match [regex]::Escape($cn)) { return $true }
+    }
     return $false
 }
 
+# 收集包内所有已知代理 DLL 的哈希，用于卸载时精确识别本项目文件
 function Initialize-KnownProxyHashes {
     $script:KnownProxyHashes = @{}
-    $files = @($script:ProxyDefault)
-    foreach ($n in $script:AltNames) { $files += (Join-Path $script:AltDir $n) }
-    $files += (Join-Path $script:PackageRoot 'archive\version.dll')
-    foreach ($f in $files) {
-        if (Test-Path -LiteralPath $f) {
-            $h = Get-Sha256 $f
-            if ($h -and -not $script:KnownProxyHashes.ContainsKey($h)) { $script:KnownProxyHashes[$h] = $f }
+    if (-not $script:PackageRoot) { return }
+
+    $names = @($script:AllProxyNames) + @('winhttp.dll')   # winhttp 为 0.2.4 旧入口
+    $dirs = @(
+        $script:PackageRoot,
+        (Join-Path $script:PackageRoot 'alternatives'),
+        (Join-Path $script:PackageRoot 'altnative'),
+        (Join-Path $script:PackageRoot '310.1'),
+        (Join-Path $script:PackageRoot '310.1\alternatives'),
+        (Join-Path $script:PackageRoot 'archive\0.2.4'),
+        (Join-Path $script:PackageRoot 'archive\0.2.4\altnative'),
+        (Join-Path $script:PackageRoot 'archive\0.1.0')
+    )
+    foreach ($d in $dirs) {
+        foreach ($n in $names) {
+            $f = Join-Path $d $n
+            if (Test-Path -LiteralPath $f) {
+                $h = Get-Sha256 $f
+                if ($h -and -not $script:KnownProxyHashes.ContainsKey($h)) { $script:KnownProxyHashes[$h] = $f }
+            }
         }
     }
 }
@@ -130,30 +168,26 @@ function Test-GameRunning($entry) {
     return [bool](Get-Process -Name $base -ErrorAction SilentlyContinue)
 }
 
-# 修改/插入 INI 键值
-function Set-IniLine([string]$text, [string]$key, [string]$value) {
+# 修改/插入 INI 键值（按指定节）
+function Set-IniLine([string]$text, [string]$key, [string]$value, [string]$section = '[Compatibility]') {
     $lines = @($text -split "`r`n|`n")
-    $found = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match ('^[ \t]*' + [regex]::Escape($key) + '[ \t]*=')) {
             $lines[$i] = "$key=$value"
-            $found = $true
-            break
+            return ($lines -join "`r`n")
         }
     }
-    if (-not $found) {
-        $ci = -1
-        for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^\[Compatibility\][ \t]*$') { $ci = $i; break }
-        }
-        if ($ci -ge 0) {
-            $before = @($lines[0..$ci])
-            $after = @()
-            if ($ci + 1 -lt $lines.Count) { $after = @($lines[($ci + 1)..($lines.Count - 1)]) }
-            $lines = $before + @("$key=$value") + $after
-        } else {
-            $lines = $lines + @('', '[Compatibility]', "$key=$value")
-        }
+    $si = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].Trim() -eq $section) { $si = $i; break }
+    }
+    if ($si -ge 0) {
+        $before = @($lines[0..$si])
+        $after = @()
+        if ($si + 1 -lt $lines.Count) { $after = @($lines[($si + 1)..($lines.Count - 1)]) }
+        $lines = $before + @("$key=$value") + $after
+    } else {
+        $lines = $lines + @('', $section, "$key=$value")
     }
     return ($lines -join "`r`n")
 }
@@ -236,7 +270,7 @@ function Show-GpuReport {
         'Supported' {
             $script:Router   = $g.Router
             $script:GpuState = 'Supported'
-            Write-Ok ("受支持：将使用 Router={0}" -f $g.Router)
+            Write-Ok ("受支持：{0}（0.3.5 出厂 INI 会自动选择内核族，无需手填 Router）" -f $g.Router)
             if ($g.Driver -and $g.Driver -lt $script:MinDriver) {
                 Write-Warn2 ("驱动版本 {0} 较旧，建议升级到较新的 NVIDIA 驱动。" -f $g.Driver)
             }
@@ -573,17 +607,48 @@ function Read-IndexSelection([int]$count) {
 }
 
 function Select-PresetMode {
-    if ($script:PresetMode) { return $script:PresetMode }
+    if ($null -ne $script:PresetMode) { return $script:PresetMode }
     Write-Host ''
-    Write-Info '选择采样档位：'
-    Write-Info '  1 = 精确档 (HardwareBilinear=0，默认，输出最准确)'
-    Write-Info '  2 = 性能档 (HardwareBilinear=1，仅 SM86 生效，可能改变生成像素)'
+    Write-Info '选择一致性档位 [FrameGeneration] Optimized：'
+    Write-Info '  0 = 原厂内核，不加速（与官方逐位一致，最保守）'
+    Write-Info '  1 = 逐位一致的加速（推荐，默认；画面与官方完全相同）'
+    Write-Info '  2 = 档位 1 + 有损图像内核（PSNR 约 50 dB 以上，仅 310.9 构建）'
+    Write-Info '  3 = 全部有损加速（画质代价最大，最快）'
     while ($true) {
-        $a = Read-Host '  档位 (回车=精确)'
-        if ([string]::IsNullOrWhiteSpace($a) -or $a -eq '1') { return 'Exact' }
-        if ($a -eq '2') { return 'Performance' }
-        Write-Warn2 '请输入 1 或 2。'
+        $a = Read-Host '  档位 (回车=1)'
+        if ([string]::IsNullOrWhiteSpace($a)) { return 1 }
+        $n = 0
+        if ([int]::TryParse($a.Trim(), [ref]$n) -and $n -ge 0 -and $n -le 3) { return $n }
+        Write-Warn2 '请输入 0 / 1 / 2 / 3。'
     }
+}
+
+# 列出包内可用的代理入口（按优先级：根目录 version.dll → 工具类 → 渲染路径 → 310.1 老构建）
+function Get-AvailableProxies {
+    $list = @()
+    if (-not $script:PackageRoot) { return $list }
+
+    $candidates = @(
+        @{ Name = 'version.dll'; Path = (Join-Path $script:PackageRoot 'version.dll') },
+        @{ Name = 'winmm.dll';   Path = (Join-Path $script:PackageRoot 'winmm.dll') },
+        @{ Name = 'winmm.dll';   Path = (Join-Path $script:PackageRoot 'alternatives\winmm.dll') },
+        @{ Name = 'dbghelp.dll'; Path = (Join-Path $script:PackageRoot 'dbghelp.dll') },
+        @{ Name = 'dbghelp.dll'; Path = (Join-Path $script:PackageRoot 'alternatives\dbghelp.dll') },
+        @{ Name = 'dinput8.dll'; Path = (Join-Path $script:PackageRoot 'dinput8.dll') },
+        @{ Name = 'dinput8.dll'; Path = (Join-Path $script:PackageRoot 'alternatives\dinput8.dll') },
+        @{ Name = 'dxgi.dll';    Path = (Join-Path $script:PackageRoot 'alternatives\dxgi.dll') },
+        @{ Name = 'd3d12.dll';   Path = (Join-Path $script:PackageRoot 'alternatives\d3d12.dll') },
+        @{ Name = 'version.dll'; Path = (Join-Path $script:PackageRoot '310.1\version.dll') }
+    )
+    $seen = @{}
+    foreach ($c in $candidates) {
+        if (-not (Test-Path -LiteralPath $c.Path)) { continue }
+        $k = $c.Name.ToLower()
+        if ($seen.ContainsKey($k)) { continue }
+        $seen[$k] = $true
+        $list += [pscustomobject]@{ Name = $c.Name; Path = (Resolve-Path -LiteralPath $c.Path).Path }
+    }
+    return $list
 }
 
 # ============================================================
@@ -591,24 +656,28 @@ function Select-PresetMode {
 # ============================================================
 function Test-PackageIntegrity {
     Write-Head '包完整性检查'
-    $sources = @($script:ProxyDefault)
-    foreach ($n in $script:AltNames) { $sources += (Join-Path $script:AltDir $n) }
+    $sources = Get-AvailableProxies
+    if ($sources.Count -eq 0) {
+        Write-Bad '包内没有找到任何可用的代理 DLL。'
+        return $false
+    }
 
     $bad = @()
-    foreach ($f in $sources) {
-        $leaf = Split-Path -Leaf $f
-        if (-not (Test-Path -LiteralPath $f)) {
-            Write-Bad ("缺少文件：{0}" -f $leaf); $bad += $f; continue
-        }
-        $len = (Get-Item -LiteralPath $f).Length
+    foreach ($s in $sources) {
+        $len = (Get-Item -LiteralPath $s.Path).Length
         if ($len -lt 1MB) {
-            Write-Bad ("{0} 体积异常 ({1} 字节)" -f $leaf, $len); $bad += $f; continue
+            Write-Bad ("{0} 体积异常 ({1} 字节)" -f $s.Name, $len); $bad += $s.Name; continue
         }
-        if (Test-ProxySignature $f) {
-            Write-Ok ("{0}  签名正常 ({1:N1} MB)" -f $leaf, ($len / 1MB))
+        if (Test-ProxySignature $s.Path) {
+            Write-Ok ("{0}  签名正常 ({1:N1} MB)" -f $s.Name, ($len / 1MB))
         } else {
-            Write-Warn2 ("{0} 未通过项目签名核验，可能被篡改。" -f $leaf); $bad += $f
+            Write-Warn2 ("{0} 未通过项目签名核验，可能被篡改。" -f $s.Name); $bad += $s.Name
         }
+    }
+    if (Test-Path -LiteralPath $script:IniSource) {
+        Write-Ok 'dlssg_sm86.ini 就绪'
+    } else {
+        Write-Warn2 '包内缺少 dlssg_sm86.ini，将使用内置出厂配置生成。'
     }
     if ($bad.Count -gt 0) {
         Write-Warn2 '存在未通过核验的 DLL，继续安装有风险。'
@@ -622,28 +691,22 @@ function Test-PackageIntegrity {
 #  安装
 # ============================================================
 function Get-ProxySource([string]$targetDir, [ref]$outName) {
-    $src = $script:ProxyDefault
-    $name = 'version.dll'
-    $existing = Join-Path $targetDir $name
+    $avail = Get-AvailableProxies
+    if ($avail.Count -eq 0) { throw '包内没有可用的代理 DLL。' }
 
-    if (Test-Path -LiteralPath $existing) {
-        $h1 = Get-Sha256 $existing
-        $h2 = Get-Sha256 $script:ProxyDefault
-        if ($h1 -ne $h2) {
-            Write-Warn2 ("{0} 已存在且不是本 Mod 文件（可能属于其他 Mod）。" -f $name)
-            $picked = $null
-            foreach ($alt in $script:AltNames) {
-                $cand = Join-Path $targetDir $alt
-                if (-not (Test-Path -LiteralPath $cand)) { $picked = $alt; break }
-            }
-            if (-not $picked) { throw 'version.dll 被占用，且所有替代入口均已被占用。' }
-            $src  = Join-Path $script:AltDir $picked
-            $name = $picked
-            Write-Info ("改用替代入口：{0}" -f $name)
+    foreach ($s in $avail) {
+        $existing = Join-Path $targetDir $s.Name
+        if (-not (Test-Path -LiteralPath $existing)) {
+            $outName.Value = $s.Name
+            return $s.Path
         }
+        if ((Get-Sha256 $existing) -eq (Get-Sha256 $s.Path)) {
+            $outName.Value = $s.Name           # 本项目文件，覆盖刷新
+            return $s.Path
+        }
+        Write-Warn2 ("{0} 已存在且不是本 Mod 文件（可能属于其他 Mod），尝试其它入口。" -f $s.Name)
     }
-    $outName.Value = $name
-    return $src
+    throw '所有可用代理入口都已被占用。'
 }
 
 function Install-ToGame($game) {
@@ -682,23 +745,20 @@ function Install-ToGame($game) {
             Write-Bad '复制后的 DLL 校验失败，已保留备份，请重试。'; return $false
         }
 
-        # 生成 INI
-        $router = $script:Router
-        if (-not $router) {
-            do { $ans = Read-Host '  未能确定显卡架构，请选择 Router (1=SM86 RTX30系 / 2=SM75 RTX20系)' }
-            while ($ans -notin @('1', '2'))
-            $router = if ($ans -eq '1') { 'SM86' } else { 'SM75' }
+        # 生成 INI（0.3.5 出厂默认已按物理显卡自动选 SM75/SM86，这里只写一致性档位）
+        if ($null -eq $script:PresetMode) { $script:PresetMode = Select-PresetMode }
+        $iniText = if (Test-Path -LiteralPath $script:IniSource) {
+            Get-Content -LiteralPath $script:IniSource -Raw
+        } else {
+            $script:IniFallback
         }
-        if (-not $script:PresetMode) { $script:PresetMode = Select-PresetMode }
-        $bilinear = if ($script:PresetMode -eq 'Performance') { '1' } else { '0' }
-
-        $iniText = Get-Content -LiteralPath $script:IniSource -Raw
-        $iniText = Set-IniLine $iniText 'Router' $router
-        $iniText = Set-IniLine $iniText 'HardwareBilinear' $bilinear
+        $iniText = Set-IniLine $iniText 'Optimized' ([string]$script:PresetMode) '[FrameGeneration]'
         Set-Content -LiteralPath $targetIni -Value $iniText -Encoding ASCII
 
-        $presetLabel = if ($bilinear -eq '1') { '性能档' } else { '精确档' }
-        Write-Ok ("已安装 {0} + dlssg_sm86.ini (Router={1}, {2})" -f $proxyName, $router, $presetLabel)
+        $tierLabel = switch ([int]$script:PresetMode) {
+            0 { '原厂内核' } 1 { '逐位一致(推荐)' } 2 { '有损~50dB' } 3 { '全部有损最快' } default { '?' }
+        }
+        Write-Ok ("已安装 {0} + dlssg_sm86.ini (Optimized={1} {2})" -f $proxyName, $script:PresetMode, $tierLabel)
         return $true
     }
     catch {
@@ -796,18 +856,17 @@ function Invoke-UninstallFlow {
 # ============================================================
 #  档位切换
 # ============================================================
-function Switch-PresetForGame($entry, [string]$mode) {
+function Switch-PresetForGame($entry, [int]$tier) {
     Write-Step ("切换档位：{0}" -f $entry.TargetDir)
     try {
         $ini = Join-Path $entry.TargetDir 'dlssg_sm86.ini'
         if (-not (Test-Path -LiteralPath $ini)) { Write-Warn2 '未找到 dlssg_sm86.ini，跳过。'; return $false }
         if (Test-IsReparse $ini) { Write-Bad 'INI 是符号链接/重解析点，拒绝写入。'; return $false }
 
-        $val = if ($mode -eq 'Performance') { '1' } else { '0' }
         $text = Get-Content -LiteralPath $ini -Raw
-        $new  = Set-IniLine $text 'HardwareBilinear' $val
+        $new  = Set-IniLine $text 'Optimized' ([string]$tier) '[FrameGeneration]'
         Set-Content -LiteralPath $ini -Value $new -Encoding ASCII
-        Write-Ok ("已设为 {0} (HardwareBilinear={1})" -f $mode, $val)
+        Write-Ok ("已设为档位 {0} (Optimized={0})" -f $tier)
         return $true
     }
     catch {
@@ -846,7 +905,7 @@ function Invoke-SwitchPresetFlow {
         if ($null -eq $sel) { return }
         if ($sel -is [string]) { Add-ManualGames -Installed; Show-GameList -Installed; continue }
 
-        if (-not $script:PresetMode) { $script:PresetMode = Select-PresetMode }
+        if ($null -eq $script:PresetMode) { $script:PresetMode = Select-PresetMode }
         $okCount = 0
         Write-Host ''
         foreach ($idx in $sel) { if (Switch-PresetForGame $script:Games[$idx] $script:PresetMode) { $okCount++ } }
@@ -895,7 +954,7 @@ function Invoke-InstallFlow {
         if ($null -eq $sel) { return }
         if ($sel -is [string]) { Add-ManualGames; Show-GameList; continue }
 
-        if (-not $script:PresetMode) { $script:PresetMode = Select-PresetMode }
+        if ($null -eq $script:PresetMode) { $script:PresetMode = Select-PresetMode }
 
         $okCount = 0
         Write-Host ''
@@ -910,6 +969,20 @@ function Invoke-InstallFlow {
 # ============================================================
 #  定位 / 下载 Mod 文件
 # ============================================================
+# 0.3.5 的包根目录可能只有 alternatives\（根目录 version.dll / INI 视发布形式而定）
+function Test-IsPackageDir([string]$d) {
+    if (-not $d -or -not (Test-Path -LiteralPath $d)) { return $false }
+    if (Test-Path -LiteralPath (Join-Path $d 'dlssg_sm86.ini')) { return $true }
+    if (Test-Path -LiteralPath (Join-Path $d 'version.dll')) { return $true }
+    foreach ($sub in @('alternatives', 'altnative')) {
+        $p = Join-Path $d $sub
+        if (Test-Path -LiteralPath $p) {
+            if (Get-ChildItem -LiteralPath $p -Filter '*.dll' -File -ErrorAction SilentlyContinue | Select-Object -First 1) { return $true }
+        }
+    }
+    return $false
+}
+
 function Find-PackageDir {
     $parents = @($script:Root)
     $parent = Split-Path -Parent $script:Root
@@ -920,15 +993,12 @@ function Find-PackageDir {
         $cands += $base
         $cands += (Join-Path $base 'dlssg_for_sm86-main')
         $cands += (Join-Path $base 'dlssg_sm86-main')
+        $cands += (Join-Path $base 'dlssg_for_sm75-main')
         $cands += (Join-Path $base 'mod')
         $cands += (Join-Path $base 'DLSSG')
     }
     foreach ($d in ($cands | Select-Object -Unique)) {
-        if (-not $d -or -not (Test-Path -LiteralPath $d)) { continue }
-        if ((Test-Path -LiteralPath (Join-Path $d 'version.dll')) -and
-            (Test-Path -LiteralPath (Join-Path $d 'dlssg_sm86.ini'))) {
-            return (Resolve-Path -LiteralPath $d).Path
-        }
+        if (Test-IsPackageDir $d) { return (Resolve-Path -LiteralPath $d).Path }
     }
     return $null
 }
@@ -982,20 +1052,23 @@ function Invoke-DownloadFile([string]$url, [string]$outFile, [int]$timeoutSec) {
 function Invoke-RawDownload([string]$destDir) {
     Write-Info '改用逐文件下载（raw.githubusercontent.com）...'
     $base = "https://raw.githubusercontent.com/$($script:RepoOwner)/$($script:RepoName)/$($script:RepoBranch)"
-    $files = @('version.dll', 'dlssg_sm86.ini', 'altnative\winmm.dll', 'altnative\dinput8.dll', 'altnative\winhttp.dll', 'altnative\dxgi.dll')
-    foreach ($f in $files) {
-        $url = "$base/$($f -replace '\\', '/')"
-        $out = Join-Path $destDir $f
-        $outDir = Split-Path -Parent $out
-        if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
-        Write-Info ("  -> {0}" -f $f)
-        $r = Invoke-DownloadFile $url $out $script:DownloadTimeoutSec
-        if (-not $r.Ok) {
-            Write-Warn2 ("  下载失败：{0} ({1})" -f $f, $r.Message)
-            return $false
-        }
+    foreach ($rel in @('dlssg_sm86.ini', 'version.dll')) {
+        $out = Join-Path $destDir $rel
+        Write-Info ("  -> {0}" -f $rel)
+        $r = Invoke-DownloadFile "$base/$rel" $out $script:DownloadTimeoutSec
+        if (-not $r.Ok) { Write-Warn2 ("  下载失败：{0} ({1})" -f $rel, $r.Message) }
     }
-    return $true
+    if (-not (Test-Path -LiteralPath (Join-Path $destDir 'version.dll'))) {
+        $rel = 'alternatives\winmm.dll'
+        $out = Join-Path $destDir $rel
+        New-Item -ItemType Directory -Path (Split-Path -Parent $out) -Force | Out-Null
+        Write-Info ("  -> {0}" -f $rel)
+        $r = Invoke-DownloadFile "$base/alternatives/winmm.dll" $out $script:DownloadTimeoutSec
+        if (-not $r.Ok) { Write-Warn2 ("  下载失败：{0} ({1})" -f $rel, $r.Message) }
+    }
+    return ((Test-Path -LiteralPath (Join-Path $destDir 'dlssg_sm86.ini')) -and
+            ((Test-Path -LiteralPath (Join-Path $destDir 'version.dll')) -or
+             (Test-Path -LiteralPath (Join-Path $destDir 'alternatives\winmm.dll'))))
 }
 
 function Invoke-GitHubDownload([string]$destDir) {
@@ -1023,12 +1096,17 @@ function Invoke-GitHubDownload([string]$destDir) {
         if (-not $inner) { throw '压缩包内容为空。' }
         foreach ($item in @('version.dll', 'dlssg_sm86.ini')) {
             $src = Join-Path $inner.FullName $item
-            if (-not (Test-Path -LiteralPath $src)) { throw ("压缩包中缺少 {0}" -f $item) }
-            Copy-Item -LiteralPath $src -Destination (Join-Path $destDir $item) -Force
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $destDir $item) -Force
+            } else {
+                Write-Warn2 ("压缩包中不含 {0}，跳过。" -f $item)
+            }
         }
-        $altSrc = Join-Path $inner.FullName 'altnative'
-        if (Test-Path -LiteralPath $altSrc) {
-            Copy-Item -LiteralPath $altSrc -Destination (Join-Path $destDir 'altnative') -Recurse -Force
+        foreach ($sub in @('alternatives', 'altnative')) {
+            $src = Join-Path $inner.FullName $sub
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $destDir $sub) -Recurse -Force
+            }
         }
         $ok = $true
     } catch {
@@ -1040,8 +1118,12 @@ function Invoke-GitHubDownload([string]$destDir) {
 
     if (-not $ok) { $ok = Invoke-RawDownload $destDir }
 
-    if ($ok -and (Test-Path -LiteralPath (Join-Path $destDir 'version.dll')) -and
-                 (Test-Path -LiteralPath (Join-Path $destDir 'dlssg_sm86.ini'))) {
+    $hasProxy = $false
+    foreach ($n in $script:AllProxyNames) {
+        if ((Test-Path -LiteralPath (Join-Path $destDir $n)) -or
+            (Test-Path -LiteralPath (Join-Path $destDir ('alternatives\' + $n)))) { $hasProxy = $true; break }
+    }
+    if ($ok -and $hasProxy -and (Test-Path -LiteralPath (Join-Path $destDir 'dlssg_sm86.ini'))) {
         Write-Ok ("下载完成：{0}" -f $destDir)
         return $true
     }
@@ -1052,11 +1134,56 @@ function Invoke-GitHubDownload([string]$destDir) {
     return $false
 }
 
+# 仅补齐包内缺失的根目录文件（version.dll / dlssg_sm86.ini）
+function Invoke-MissingFilesDownload([string]$destDir, [string[]]$names) {
+    Write-Info ("项目地址：{0}" -f $script:ProjectUrl)
+    $proxy = Get-SystemProxyUri
+    if ($proxy) { Write-Info ("检测到系统代理：{0}" -f $proxy) }
+    else { Write-Warn2 '未检测到系统代理；若网络受限，请先开启代理（科学上网 / Clash 等）。' }
+
+    $base = "https://raw.githubusercontent.com/$($script:RepoOwner)/$($script:RepoName)/$($script:RepoBranch)"
+    $all = $true
+    foreach ($n in $names) {
+        $out = Join-Path $destDir $n
+        Write-Info ("  -> {0}" -f $n)
+        $r = Invoke-DownloadFile "$base/$n" $out $script:DownloadTimeoutSec
+        if ($r.Ok) {
+            if ($n -notlike '*.dll') {
+                Write-Ok ("已补齐：{0}" -f $n)
+            } elseif (Test-ProxySignature $out) {
+                Write-Ok ("已补齐并核验签名：{0}" -f $n)
+            } else {
+                Write-Warn2 ("已补齐：{0}（未通过签名核验，应用前会提示）" -f $n)
+            }
+        } else {
+            Write-Warn2 ("补齐失败：{0} ({1})" -f $n, $r.Message)
+            $all = $false
+        }
+    }
+    if (-not $all) { Write-Warn2 '未能补齐；将使用包内 alternatives\ 中的替代入口继续。' }
+    return $all
+}
+
 function Resolve-PackageRoot {
     $found = Find-PackageDir
-    if ($found) { return $found }
+    if ($found) {
+        $script:PackageRoot = $found
+        $missing = @()
+        if (-not (Test-Path -LiteralPath (Join-Path $found 'version.dll')))    { $missing += 'version.dll' }
+        if (-not (Test-Path -LiteralPath (Join-Path $found 'dlssg_sm86.ini'))) { $missing += 'dlssg_sm86.ini' }
+        if ($missing.Count -gt 0) {
+            Write-Warn2 ("包内缺少根目录文件：{0}" -f ($missing -join '、'))
+            $doIt = $true
+            if (-not $ListOnly) {
+                $a = Read-Host '  是否从 GitHub 补齐这些文件？(Y/n)'
+                if ($a -match '^[Nn]') { $doIt = $false }
+            }
+            if ($doIt) { [void](Invoke-MissingFilesDownload $found $missing) }
+        }
+        return $found
+    }
 
-    Write-Warn2 '未在工具目录附近找到 version.dll / dlssg_sm86.ini。'
+    Write-Warn2 '未在工具目录附近找到 Mod 包（version.dll / dlssg_sm86.ini / alternatives\）。'
     Write-Info ("项目地址：{0}" -f $script:ProjectUrl)
 
     $dest = Join-Path $script:Root 'mod'
@@ -1082,7 +1209,7 @@ function Invoke-Interactive {
         Write-Head '请选择操作'
         Write-Host '  1. 安装 / 更新 Mod 到游戏'   -ForegroundColor White
         Write-Host '  2. 卸载 Mod'                 -ForegroundColor White
-        Write-Host '  3. 切换采样档位 (精确 / 性能)' -ForegroundColor White
+        Write-Host '  3. 切换一致性档位 (Optimized 0-3)' -ForegroundColor White
         Write-Host '  q. 退出'                      -ForegroundColor White
         $m = Read-Host '  选择'
         switch ($m.Trim()) {
@@ -1098,11 +1225,12 @@ function Invoke-Interactive {
 
 function Invoke-Main {
     Write-Host ''
-    Write-Host '  DLSSG Native 0.2.4 一键部署 / 管理工具' -ForegroundColor Cyan
+    Write-Host '  DLSSG for SM86 (Proxy) 0.3.5 一键部署 / 管理工具' -ForegroundColor Cyan
     Write-Host '  (RTX 20/30 系 DLSS 帧生成)' -ForegroundColor DarkGray
     Write-Host ("  项目地址：{0}" -f $script:ProjectUrl) -ForegroundColor DarkGray
 
     if ($RepoUrl) { Set-RepoFromUrl $RepoUrl }
+    if ($Tier -gt 3) { Write-Bad '档位只能是 0 / 1 / 2 / 3。'; return }
 
     $pkg = Resolve-PackageRoot
     if (-not $pkg) {
@@ -1113,7 +1241,7 @@ function Invoke-Main {
     $script:PackageRoot  = $pkg
     $script:ProxyDefault = Join-Path $pkg 'version.dll'
     $script:IniSource    = Join-Path $pkg 'dlssg_sm86.ini'
-    $script:AltDir       = Join-Path $pkg 'altnative'
+    $script:AltDir       = Join-Path $pkg 'alternatives'
 
     Initialize-KnownProxyHashes
 
