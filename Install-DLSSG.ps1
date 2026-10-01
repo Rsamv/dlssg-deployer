@@ -700,13 +700,43 @@ function Get-ProxySource([string]$targetDir, [ref]$outName) {
             $outName.Value = $s.Name
             return $s.Path
         }
-        if ((Get-Sha256 $existing) -eq (Get-Sha256 $s.Path)) {
-            $outName.Value = $s.Name           # 本项目文件，覆盖刷新
+        $hExist = Get-Sha256 $existing
+        $hSrc   = Get-Sha256 $s.Path
+        if ($hExist -eq $hSrc) {
+            $outName.Value = $s.Name                 # 已是当前版本，刷新
+            return $s.Path
+        }
+        if ($hExist -and $script:KnownProxyHashes.ContainsKey($hExist)) {
+            # 本项目旧版本（例如 0.2.4 的 version.dll）：就地升级，不再新增第二个入口
+            $srcLabel = $script:KnownProxyHashes[$hExist]
+            if ($script:PackageRoot -and $srcLabel.StartsWith($script:PackageRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $srcLabel = $srcLabel.Substring($script:PackageRoot.Length).TrimStart('\')
+            }
+            Write-Info ("检测到本项目旧版本的 {0}（包内 {1}），就地升级为新版。" -f $s.Name, $srcLabel)
+            $outName.Value = $s.Name
             return $s.Path
         }
         Write-Warn2 ("{0} 已存在且不是本 Mod 文件（可能属于其他 Mod），尝试其它入口。" -f $s.Name)
     }
     throw '所有可用代理入口都已被占用。'
+}
+
+# 移除同目录下其它已知的本项目代理（旧版本 / 重复入口）：
+# 两个不同版本同时注入同一个进程会互相冲突，必须只留一个
+function Remove-StaleProjectProxies([string]$targetDir, [string]$keepName, [string]$backupDir) {
+    $removed = @()
+    foreach ($n in $script:AllProxyNames) {
+        if ($n -eq $keepName) { continue }
+        $f = Join-Path $targetDir $n
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        $h = Get-Sha256 $f
+        if (-not $h -or -not $script:KnownProxyHashes.ContainsKey($h)) { continue }
+        if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+        Copy-Item -LiteralPath $f -Destination (Join-Path $backupDir $n) -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $f)) { $removed += $n }
+    }
+    return $removed
 }
 
 function Install-ToGame($game) {
@@ -743,6 +773,12 @@ function Install-ToGame($game) {
         Copy-Item -LiteralPath $srcDll -Destination $targetDll -Force
         if ((Get-Sha256 $srcDll) -ne (Get-Sha256 $targetDll)) {
             Write-Bad '复制后的 DLL 校验失败，已保留备份，请重试。'; return $false
+        }
+
+        # 清理同目录下其它本项目的代理入口（两个版本同时注入会互相冲突）
+        $stale = Remove-StaleProjectProxies $game.TargetDir $proxyName $backupDir
+        if ($stale.Count -gt 0) {
+            Write-Warn2 ("检测到同目录下本项目的其它代理入口，已移入备份目录：{0}" -f ($stale -join '、'))
         }
 
         # 生成 INI（0.3.5 出厂默认已按物理显卡自动选 SM75/SM86，这里只写一致性档位）

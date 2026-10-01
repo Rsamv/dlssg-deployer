@@ -110,6 +110,10 @@ powershell -ExecutionPolicy Bypass -File .\Install-DLSSG.ps1 -Uninstall
   默认代理入口为根目录 `version.dll`。
 - **入口冲突处理**：若 `version.dll` 已被其他 Mod 占用，自动按
   `winmm.dll` → `dbghelp.dll` → `dinput8.dll` → `dxgi.dll` → `d3d12.dll` 顺序改用未被占用的入口。
+- **旧版本就地升级**：若目标目录里是本项目**旧版本**的代理 DLL（例如 0.2.4 的 `version.dll`），
+  会直接在原位置升级为新版，而不是另加一个入口；同目录下其它本项目的代理入口
+  （如上一轮留下的 `winmm.dll`）会被移入备份目录——两个不同版本同时注入同一进程会互相冲突。
+  判定依据是 SHA256 是否命中包内已知文件（含 `archive\` 历史版本），**其他 Mod 的文件一律不动**。
 - **卸载**：按 SHA256 精确识别本项目文件，仅移除本项目的代理 DLL 与 INI，可一键从备份恢复。
 - **档位切换**：改写 `[FrameGeneration] Optimized`，无需重新安装。
 - **缺失文件补齐**：包内缺少根目录 `version.dll` / `dlssg_sm86.ini` 时，可在提示后从 GitHub 补齐；
